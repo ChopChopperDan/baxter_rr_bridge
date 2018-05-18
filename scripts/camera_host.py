@@ -81,7 +81,7 @@ class BaxterCamera_impl(object):
         self._camera_name = camera_name;
         
         # automatically close camera at start
-        self._camera.close()
+        # self._camera.close()
         self._camera_open = False
         
         # set constant ImageHeader structure
