@@ -3,6 +3,8 @@ import roslib
 roslib.load_manifest('baxter_rr_bridge')
 import rospy
 import baxter_interface
+import cv2
+import cv2.aruco as aruco
 from sensor_msgs.msg import Image
 from sensor_msgs.msg import CameraInfo
 
@@ -39,6 +41,12 @@ struct ImageHeader
     field int32 step
 end struct
 
+struct ARtagInfo
+    field double[] rvec
+    field double[] tvec
+    field int32[] ids
+end struct
+
 object BaxterCamera
 
     property uint8 camera_open
@@ -50,11 +58,15 @@ object BaxterCamera
     function void setGain(int16 gain)
     function void setWhiteBalance(int16 red, int16 green, int16 blue)
     function void setFPS(double fps)
+    function void setCameraIntrinsics(CameraIntrinsics data)
+    function void setMarkerSize(uint8 markerSize)
     
     # functions to acquire data on the image
     function BaxterImage getCurrentImage()
     function ImageHeader getImageHeader()
     function CameraIntrinsics getCameraIntrinsics()
+    function uint8 getMarkerSize()
+    function ARtagInfo ARtag_Detection()
     
     # pipe to stream images through
     pipe BaxterImage ImageStream
@@ -81,7 +93,7 @@ class BaxterCamera_impl(object):
         self._camera_name = camera_name;
         
         # automatically close camera at start
-        self._camera.close()
+        # self._camera.close()
         self._camera_open = False
         
         # set constant ImageHeader structure
@@ -107,6 +119,11 @@ class BaxterCamera_impl(object):
         self._image.width = self._image_header.width
         self._image.height = self._image_header.height
         self._image.step = self._image_header.step
+
+        # Initialize ARtag detection
+        self._aruco_dict = aruco.Dictionary_get(aruco.DICT_ARUCO_ORIGINAL)
+        self._arucoParams = aruco.DetectorParameters_create()
+        self._markerSize = 0.06
         
     # open camera 
     def openCamera(self):
@@ -164,22 +181,32 @@ class BaxterCamera_impl(object):
                     except:
                         # on error, assume pipe has been closed
                         self.ImageStream_pipeclosed(pipe_ep)
-                        
     
-    def set_CameraIntrinsics(self,data):
+    def set_CameraIntrinsics(self, data):
         if (self._camera_intrinsics is None):
             print "Setting Camera Intrinsic Data"
             self._camera_intrinsics = RR.RobotRaconteurNode.s.NewStructure( 
-                                    "BaxterCamera_interface.CameraIntrinsics" )
+                                        "BaxterCamera_interface.CameraIntrinsics" )
             K = list(data.K)
             K[2] -= data.roi.x_offset;
             K[5] -= data.roi.y_offset;
             self._camera_intrinsics.K = tuple(K)
             self._camera_intrinsics.D = tuple(data.D)
             self._caminfo_sub.unregister()
-    
+
+    # The following function is to set camera parameters manually
+    def setCameraIntrinsics(self, data):
+        if (self._camera_intrinsics is None):
+            print "Setting Camera Intrinsic Data"
+        else:
+            print "Setting already exists. Overwriting now..."
+        K = list(data.K)
+        self._camera_intrinsics.K = tuple(K)
+        self._camera_intrinsics.D = tuple(data.D)
+        self._caminfo_sub.unregister()
+            
     def getCurrentImage(self):
-        with self._lock:
+        with self._lock:    
             return self._image
     
     def getImageHeader(self):
@@ -236,7 +263,81 @@ class BaxterCamera_impl(object):
             print 'fps must be positive and cannot exceed 30'
             return
         self._camera.fps = fps
-    
+
+    # Functions related to AR tags
+    # Marker size
+    def setMarkerSize(self, markerSize):
+        with self._lock:
+            self._markerSize = markerSize
+
+    def getMarkerSize(self):
+        with self._lock:
+            markerSize = self._markerSize
+            return markerSize
+
+    # need modifications ################
+    def ARtag_Detection(self):
+        if not self.camera_open:
+            self.openCamera()
+        print "Detecting AR tags..."
+        currentImage = self.getCurrentImage()
+        imageData = currentImage.data
+        # constructing BGR matrix
+        Blist = [None] * currentImage.width * currentImage.height
+        Glist = [None] * currentImage.width * currentImage.height
+        Rlist = [None] * currentImage.width * currentImage.height
+        i = 0
+        while i < currentImage.step * currentImage.width * currentImage.height:
+            Blist[i/currentImage.step] = imageData[i]
+            i += 1
+            Glist[i/currentImage.step] = imageData[i]
+            i += 1
+            Rlist[i/currentImage.step] = imageData[i]
+            i += (currentImage.step - 2)
+        # make those lists into opencv usable numpy array format and reshape them 
+        Brow = numpy.array(Blist)
+        Grow = numpy.array(Glist)
+        Rrow = numpy.array(Rlist)
+        B = numpy.reshape(Brow, (currentImage.height, currentImage.width))
+        G = numpy.reshape(Grow, (currentImage.height, currentImage.width))
+        R = numpy.reshape(Rrow, (currentImage.height, currentImage.width))
+        # merge into a colored image then converted into grayscale
+        trueImgData = cv2.merge((B,G,R))
+        gray = cv2.cvtColor(trueImgData, cv2.COLOR_BGR2GRAY)
+        # detect aruco tags
+        corners, ids, rejected = aruco.detectMarkers(trueImgData, self._aruco_dict, parameters=self._arucoParams) 
+        # debug information
+        print(corners, ids) 
+        # make sure tag are detected
+        markerLength = self._markerSize # unit in meters
+        if ids is not None:
+            camparam = numpy.reshape(self._camera_intrinsics.K, (3, 3))
+            rvec, tvec, _objpoints = aruco.estimatePoseSingleMarkers(corners, markerLength, camparam, self._camera_intrinsics.D) # For a single marker
+            print(rvec, tvec)
+            detectioninfo = RR.RobotRaconteurNode.s.NewStructure("BaxterCamera_interface.ARtagInfo")
+            rvecs = []
+            tvecs = []
+            allids = []
+            for rveci in rvec:
+                x, y, z = rveci[0]
+                rvecs.append(x)
+                rvecs.append(y)
+                rvecs.append(z)
+            for tveci in tvec:
+                x, y, z = tveci[0]
+                tvecs.append(x)
+                tvecs.append(y)
+                tvecs.append(z)
+            for id_i in ids:
+                allids.append(id_i[0])
+            detectioninfo.rvec = rvecs
+            detectioninfo.tvec = tvecs
+            detectioninfo.ids = allids
+            return detectioninfo
+
+
+    ######################################
+
     # pipe functions
     @property
     def ImageStream(self):
